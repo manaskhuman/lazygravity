@@ -1,21 +1,45 @@
+/**
+ * Service to manage and send periodic heartbeat messages to a configured Discord channel.
+ */
+
 import { Client, EmbedBuilder, TextChannel } from 'discord.js';
 import { logger } from '../utils/logger';
 import { ConfigLoader } from '../utils/configLoader';
 import { CdpBridge } from './cdpBridgeManager';
 
+/**
+ * Service that publishes status, uptime, activity, and session metrics at regular intervals.
+ */
 export class HeartbeatService {
+    /** Target Discord client interface instance. */
     private client: Client | null = null;
+    /** Target CdpBridge manager. */
     private bridge: CdpBridge | null = null;
+    /** Active polling interval timer. */
     private intervalId: NodeJS.Timeout | null = null;
     
+    /** Generation token used to ignore obsolete delayed requests. */
     private generationToken: number = 0;
+    /** Lock flag to prevent overlapping send requests. */
     private isSending: boolean = false;
+    /** Tracks whether a send request is queued to run after the active send completes. */
+    private nextSendQueued: boolean = false;
     
+    /** Timestamp when the bot application started. */
     public botStartTime: number = Date.now();
+    /** Timestamp of the most recent user action. */
     public lastActivityTimestamp: number = Date.now();
 
+    /**
+     * Initializes a new HeartbeatService.
+     */
     constructor() {}
 
+    /**
+     * Binds the Discord client and CdpBridge dependencies.
+     * @param client Discord client connection.
+     * @param bridge active bridge manager.
+     */
     public init(client: Client, bridge: CdpBridge) {
         this.client = client;
         this.bridge = bridge;
@@ -23,10 +47,16 @@ export class HeartbeatService {
         this.lastActivityTimestamp = Date.now();
     }
 
+    /**
+     * Records user/client activity by resetting the activity timestamp.
+     */
     public recordActivity() {
         this.lastActivityTimestamp = Date.now();
     }
 
+    /**
+     * Starts the periodic heartbeat posting loop if enabled by configuration.
+     */
     public start() {
         this.stop();
 
@@ -64,36 +94,70 @@ export class HeartbeatService {
         }, interval);
     }
 
+    /**
+     * Stops the periodic heartbeat loop and increments the generation token.
+     */
     public stop() {
         this.generationToken++;
+        this.nextSendQueued = false;
         if (this.intervalId) {
             clearInterval(this.intervalId);
             this.intervalId = null;
         }
     }
 
+    /**
+     * Updates the local configuration and restarts the loop.
+     * @param enabled Enabled state flag.
+     * @param intervalMs Cycle delay in milliseconds.
+     * @param channelId Destination Discord channel ID.
+     */
     public async updateConfig(enabled: boolean, intervalMs: number, channelId: string) {
-        this.generationToken++;
+        this.stop();
+        const gen = this.generationToken;
         const config = ConfigLoader.load();
         
         // If channel changed, clear the last message ID
         if (config.heartbeatChannelId !== channelId) {
+            let clearId = false;
             if (config.heartbeatChannelId && config.heartbeatLastMessageId) {
                 try {
                     const oldChannel = await this.client?.channels.fetch(config.heartbeatChannelId);
+                    if (gen !== this.generationToken) return;
                     if (oldChannel && oldChannel.isTextBased()) {
-                        const oldMsg = await (oldChannel as TextChannel).messages.fetch(config.heartbeatLastMessageId);
-                        if (oldMsg) {
-                            await oldMsg.delete().catch(() => {});
+                        try {
+                            const oldMsg = await (oldChannel as TextChannel).messages.fetch(config.heartbeatLastMessageId);
+                            if (gen !== this.generationToken) return;
+                            if (oldMsg) {
+                                await oldMsg.delete();
+                                clearId = true;
+                            }
+                        } catch (err: any) {
+                            if (err?.code === 10008 || err?.status === 404) {
+                                clearId = true;
+                            } else {
+                                throw err;
+                            }
                         }
+                    } else {
+                        clearId = true;
                     }
-                } catch (err) {
+                } catch (err: any) {
                     logger.debug('[HeartbeatService] Failed to delete old heartbeat message from previous channel:', err);
+                    if (err?.code === 10008 || err?.code === 10003 || err?.status === 404) {
+                        clearId = true;
+                    }
                 }
+            } else {
+                clearId = true;
             }
-            ConfigLoader.save({ heartbeatLastMessageId: undefined });
+            if (gen !== this.generationToken) return;
+            if (clearId) {
+                ConfigLoader.save({ heartbeatLastMessageId: undefined });
+            }
         }
 
+        if (gen !== this.generationToken) return;
         // Save to config.json
         ConfigLoader.save({
             heartbeatEnabled: enabled,
@@ -107,30 +171,56 @@ export class HeartbeatService {
         this.start();
     }
 
+    /**
+     * Deletes the active message, updates configuration state to disabled, and stops the loop.
+     */
     public async disable() {
-        this.generationToken++;
+        this.stop();
+        const gen = this.generationToken;
         const config = ConfigLoader.load();
+        let clearId = false;
         if (config.heartbeatChannelId && config.heartbeatLastMessageId) {
             try {
                 const oldChannel = await this.client?.channels.fetch(config.heartbeatChannelId);
+                if (gen !== this.generationToken) return;
                 if (oldChannel && oldChannel.isTextBased()) {
-                    const oldMsg = await (oldChannel as TextChannel).messages.fetch(config.heartbeatLastMessageId);
-                    if (oldMsg) {
-                        await oldMsg.delete().catch(() => {});
+                    try {
+                        const oldMsg = await (oldChannel as TextChannel).messages.fetch(config.heartbeatLastMessageId);
+                        if (gen !== this.generationToken) return;
+                        if (oldMsg) {
+                            await oldMsg.delete();
+                            clearId = true;
+                        }
+                    } catch (err: any) {
+                        if (err?.code === 10008 || err?.status === 404) {
+                            clearId = true;
+                        } else {
+                            throw err;
+                        }
                     }
+                } else {
+                    clearId = true;
                 }
-            } catch (err) {
+            } catch (err: any) {
                 logger.debug('[HeartbeatService] Failed to delete heartbeat message upon disabling:', err);
+                if (err?.code === 10008 || err?.code === 10003 || err?.status === 404) {
+                    clearId = true;
+                }
             }
+        } else {
+            clearId = true;
         }
+        if (gen !== this.generationToken) return;
         ConfigLoader.save({
             heartbeatEnabled: false,
-            heartbeatLastMessageId: undefined,
+            heartbeatLastMessageId: clearId ? undefined : config.heartbeatLastMessageId,
         });
-        this.stop();
         logger.info('[HeartbeatService] Heartbeat disabled.');
     }
 
+    /**
+     * Formulates and posts/edits the heartbeat embed on the configured channel.
+     */
     public async sendHeartbeat() {
         if (!this.client || !this.bridge) {
             logger.warn('[HeartbeatService] Cannot send heartbeat: client or bridge not initialized.');
@@ -138,21 +228,21 @@ export class HeartbeatService {
         }
 
         if (this.isSending) {
-            logger.debug('[HeartbeatService] Heartbeat send already in flight. Skipping overlapping execution.');
+            logger.debug('[HeartbeatService] Heartbeat send already in flight. Queueing follow-up send.');
+            this.nextSendQueued = true;
             return;
         }
 
         const gen = this.generationToken;
         this.isSending = true;
 
-        const config = ConfigLoader.load();
-        const channelId = config.heartbeatChannelId;
-        if (!channelId) {
-            this.isSending = false;
-            return;
-        }
-
         try {
+            const config = ConfigLoader.load();
+            const channelId = config.heartbeatChannelId;
+            if (!channelId) {
+                return;
+            }
+
             const channel = await this.client.channels.fetch(channelId);
             if (gen !== this.generationToken) {
                 logger.debug(`[HeartbeatService] Aborting heartbeat send: stale generation (expected ${gen}, current ${this.generationToken})`);
@@ -204,9 +294,19 @@ export class HeartbeatService {
             logger.error('[HeartbeatService] Error in sendHeartbeat:', error);
         } finally {
             this.isSending = false;
+            if (this.nextSendQueued) {
+                this.nextSendQueued = false;
+                this.sendHeartbeat().catch(err => {
+                    logger.error('[HeartbeatService] Failed to send queued heartbeat:', err);
+                });
+            }
         }
     }
 
+    /**
+     * Constructs the heartbeat visual embed with diagnostic information.
+     * @returns Mapped EmbedBuilder instance.
+     */
     private buildHeartbeatEmbed(): EmbedBuilder {
         const uptimeMs = Date.now() - this.botStartTime;
         const uptimeStr = formatDuration(uptimeMs);
@@ -234,6 +334,8 @@ export class HeartbeatService {
 /**
  * Parse a duration string like "1h", "6h", "30m", or "2d" to milliseconds.
  * Requiring a unit prevents ambiguity with bare numbers.
+ * @param str Input raw interval string.
+ * @returns Millisecond value, or null if parser pattern mismatch.
  */
 export function parseInterval(str: string): number | null {
     const match = str.trim().toLowerCase().match(/^(\d+)(ms|s|m|h|d)$/);
@@ -253,6 +355,8 @@ export function parseInterval(str: string): number | null {
 
 /**
  * Format milliseconds to a human-readable duration (e.g. "2h 15m")
+ * @param ms Time segment in milliseconds.
+ * @returns Formatted friendly duration text.
  */
 export function formatDuration(ms: number): string {
     const seconds = Math.floor((ms / 1000) % 60);
@@ -270,6 +374,8 @@ export function formatDuration(ms: number): string {
 
 /**
  * Format a past timestamp to a relative string (e.g. "5m ago")
+ * @param timestamp Historical epoch timestamp.
+ * @returns Friendly relative time suffix.
  */
 export function formatRelativeTime(timestamp: number): string {
     const diff = Date.now() - timestamp;

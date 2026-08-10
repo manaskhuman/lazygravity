@@ -176,8 +176,18 @@ const RESPONSE_DELIVERY_MODE = resolveResponseDeliveryMode();
 
 /** Tracks channel IDs where /stop was explicitly invoked by the user */
 const userStopRequestedChannels = new Set<string>();
+/**
+ * Test helper to retrieve the response delivery mode.
+ * @returns Response delivery mode string.
+ */
 export const getResponseDeliveryModeForTest = (): string => RESPONSE_DELIVERY_MODE;
 
+/**
+ * Test helper to instantiate a serial task queue executor.
+ * @param queueName Target queue identifier label.
+ * @param traceId Diagnostic correlation trace ID.
+ * @returns Queue runner executor function.
+ */
 export function createSerialTaskQueueForTest(queueName: string, traceId: string): (task: () => Promise<void>, label?: string) => Promise<void> {
     let queue: Promise<void> = Promise.resolve();
     let queueDepth = 0;
@@ -2317,6 +2327,8 @@ export async function handleSlashInteraction(
                         '`/account` — Show and switch Antigravity account',
                         '`/logs [lines] [level]` — View recent bot logs',
                         '`/cleanup [days]` — Clean up unused channels/categories',
+                        '`/heartbeat [on|off|status]` — Configure periodic bot heartbeat notifications',
+                        '`/schedule [add|list|remove|clear|backup|restore]` — Manage scheduled tasks',
                         '`/help` — Show this help',
                     ].join('\n')
                 },
@@ -2841,10 +2853,8 @@ export async function handleSlashInteraction(
                     break;
                 }
 
-                // Check permissions
-                const botUser = interaction.client.user;
-                const permissions = (targetChannel as any).permissionsFor?.(botUser);
-                if (!permissions || !permissions.has('SendMessages') || !permissions.has('EmbedLinks')) {
+                const permissions = (targetChannel as any).permissionsFor?.(interaction.client.user);
+                if (permissions && (!permissions.has('SendMessages') || !permissions.has('EmbedLinks'))) {
                     await interaction.editReply({ content: '⚠️ Bot does not have permission to send messages and embed links in that channel.' });
                     break;
                 }
@@ -3068,11 +3078,33 @@ export async function handleSlashInteraction(
                     break;
                 }
 
+                if (attachment.size > 1024 * 1024) {
+                    await interaction.editReply({ content: '❌ Attachment exceeds maximum size limit of 1MB.' });
+                    break;
+                }
+
+                let timeoutId: NodeJS.Timeout | undefined;
                 try {
-                    // Download file content using global fetch (available in Node 18+)
-                    const response = await fetch(attachment.url);
-                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                    const jsonText = await response.text();
+                    const controller = new AbortController();
+                    timeoutId = setTimeout(() => controller.abort(), 10000);
+
+                    let jsonText: string;
+                    try {
+                        // Download file content using global fetch (available in Node 18+)
+                        const response = await fetch(attachment.url, { signal: controller.signal });
+                        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+                        const contentLength = response.headers.get('content-length');
+                        if (contentLength && parseInt(contentLength, 10) > 1024 * 1024) {
+                            throw new Error('Response body exceeds maximum size limit of 1MB.');
+                        }
+
+                        jsonText = await response.text();
+                    } finally {
+                        if (timeoutId) {
+                            clearTimeout(timeoutId);
+                        }
+                    }
 
                     const jobCb = scheduleService.getJobCallback();
                     if (!jobCb) {
